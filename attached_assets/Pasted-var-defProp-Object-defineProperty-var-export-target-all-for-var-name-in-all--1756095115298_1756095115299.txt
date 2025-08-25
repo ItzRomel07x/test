@@ -1,0 +1,978 @@
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+
+// server/index.ts
+import express2 from "express";
+
+// server/routes.ts
+import { createServer } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+
+// server/auth.ts
+import passport from "passport";
+import { Strategy as LocalStrategy } from "passport-local";
+import session2 from "express-session";
+import { scrypt, randomBytes, timingSafeEqual } from "crypto";
+import { promisify } from "util";
+
+// shared/schema.ts
+var schema_exports = {};
+__export(schema_exports, {
+  announcements: () => announcements,
+  categories: () => categories,
+  chatMessages: () => chatMessages,
+  chatMessagesRelations: () => chatMessagesRelations,
+  chatSessions: () => chatSessions,
+  chatSessionsRelations: () => chatSessionsRelations,
+  insertAnnouncementSchema: () => insertAnnouncementSchema,
+  insertCategorySchema: () => insertCategorySchema,
+  insertChatMessageSchema: () => insertChatMessageSchema,
+  insertChatSessionSchema: () => insertChatSessionSchema,
+  insertProductSchema: () => insertProductSchema,
+  insertResourceSchema: () => insertResourceSchema,
+  insertUserSchema: () => insertUserSchema,
+  products: () => products,
+  resources: () => resources,
+  updateProductSchema: () => updateProductSchema,
+  updateResourceSchema: () => updateResourceSchema,
+  users: () => users
+});
+import { pgTable, text, serial, integer, boolean, decimal, timestamp } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { relations } from "drizzle-orm";
+var users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  username: text("username").notNull().unique(),
+  password: text("password").notNull(),
+  isAdmin: boolean("is_admin").default(false).notNull(),
+  role: text("role").default("user").notNull(),
+  // "owner", "admin", "user"
+  createdBy: integer("created_by").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow().notNull()
+});
+var products = pgTable("products", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  description: text("description").notNull(),
+  price: decimal("price", { precision: 10, scale: 2 }).notNull(),
+  currency: text("currency", { enum: ["USD", "INR", "BDT"] }).notNull().default("USD"),
+  priceInr: decimal("price_inr", { precision: 10, scale: 2 }),
+  category: text("category", {
+    enum: ["External Panel", "Internal Panel", "Bypass", "Silent Aim", "AimKill"]
+  }).notNull(),
+  images: text("images").array().notNull().default([]),
+  isActive: boolean("is_active").default(true).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull()
+});
+var announcements = pgTable("announcements", {
+  id: serial("id").primaryKey(),
+  message: text("message").notNull(),
+  isActive: boolean("is_active").default(true).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull()
+});
+var categories = pgTable("categories", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  description: text("description"),
+  isActive: boolean("is_active").default(true).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull()
+});
+var resources = pgTable("resources", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  description: text("description").notNull(),
+  image: text("image"),
+  downloadUrl: text("download_url").notNull(),
+  isFree: boolean("is_free").default(false).notNull(),
+  isActive: boolean("is_active").default(true).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull()
+});
+var chatSessions = pgTable("chat_sessions", {
+  id: text("id").primaryKey(),
+  username: text("username").notNull(),
+  isActive: boolean("is_active").default(true).notNull(),
+  lastMessageAt: timestamp("last_message_at").defaultNow().notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull()
+});
+var chatMessages = pgTable("chat_messages", {
+  id: serial("id").primaryKey(),
+  sessionId: text("session_id").notNull().references(() => chatSessions.id),
+  userId: integer("user_id"),
+  username: text("username").notNull(),
+  message: text("message").notNull(),
+  isAdmin: boolean("is_admin").default(false).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull()
+});
+var chatSessionsRelations = relations(chatSessions, ({ many }) => ({
+  messages: many(chatMessages)
+}));
+var chatMessagesRelations = relations(chatMessages, ({ one }) => ({
+  user: one(users, {
+    fields: [chatMessages.userId],
+    references: [users.id]
+  }),
+  session: one(chatSessions, {
+    fields: [chatMessages.sessionId],
+    references: [chatSessions.id]
+  })
+}));
+var insertUserSchema = createInsertSchema(users).pick({
+  username: true,
+  password: true,
+  isAdmin: true
+});
+var insertProductSchema = createInsertSchema(products).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true
+});
+var updateProductSchema = insertProductSchema.partial();
+var insertAnnouncementSchema = createInsertSchema(announcements).omit({
+  id: true,
+  createdAt: true
+});
+var insertChatSessionSchema = createInsertSchema(chatSessions).omit({
+  createdAt: true,
+  lastMessageAt: true
+});
+var insertChatMessageSchema = createInsertSchema(chatMessages).omit({
+  id: true,
+  createdAt: true
+});
+var insertCategorySchema = createInsertSchema(categories).omit({
+  id: true,
+  createdAt: true
+});
+var insertResourceSchema = createInsertSchema(resources).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true
+});
+var updateResourceSchema = insertResourceSchema.partial();
+
+// server/db.ts
+import { Pool, neonConfig } from "@neondatabase/serverless";
+import { drizzle } from "drizzle-orm/neon-serverless";
+import ws from "ws";
+neonConfig.webSocketConstructor = ws;
+if (!process.env.DATABASE_URL) {
+  throw new Error(
+    "DATABASE_URL must be set. Did you forget to provision a database?"
+  );
+}
+var pool = new Pool({ connectionString: process.env.DATABASE_URL });
+var db = drizzle({ client: pool, schema: schema_exports });
+
+// server/storage.ts
+import { eq, desc, ilike, or } from "drizzle-orm";
+import session from "express-session";
+import connectPg from "connect-pg-simple";
+var PostgresSessionStore = connectPg(session);
+var DatabaseStorage = class {
+  sessionStore;
+  constructor() {
+    this.sessionStore = new PostgresSessionStore({
+      pool,
+      createTableIfMissing: true
+    });
+  }
+  async getUser(id) {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user || void 0;
+  }
+  async getUserByUsername(username) {
+    const [user] = await db.select().from(users).where(eq(users.username, username));
+    return user || void 0;
+  }
+  async createUser(insertUser) {
+    const [user] = await db.insert(users).values(insertUser).returning();
+    return user;
+  }
+  async getAllUsers() {
+    const userList = await db.select().from(users).orderBy(desc(users.createdAt));
+    return userList;
+  }
+  async getAllProducts(filters) {
+    let query = db.select().from(products).where(eq(products.isActive, true));
+    if (filters?.category) {
+      query = query.where(eq(products.category, filters.category));
+    }
+    if (filters?.search) {
+      query = query.where(
+        or(
+          ilike(products.title, `%${filters.search}%`),
+          ilike(products.description, `%${filters.search}%`)
+        )
+      );
+    }
+    return await query.orderBy(desc(products.createdAt));
+  }
+  async getProduct(id) {
+    const [product] = await db.select().from(products).where(eq(products.id, id));
+    return product || void 0;
+  }
+  async createProduct(product) {
+    const [created] = await db.insert(products).values(product).returning();
+    return created;
+  }
+  async updateProduct(id, updates) {
+    const [updated] = await db.update(products).set({ ...updates, updatedAt: /* @__PURE__ */ new Date() }).where(eq(products.id, id)).returning();
+    return updated || void 0;
+  }
+  async deleteProduct(id) {
+    const result = await db.update(products).set({ isActive: false }).where(eq(products.id, id));
+    return result.rowCount > 0;
+  }
+  async getActiveAnnouncement() {
+    const [announcement] = await db.select().from(announcements).where(eq(announcements.isActive, true)).orderBy(desc(announcements.createdAt)).limit(1);
+    return announcement || void 0;
+  }
+  async updateAnnouncement(announcement) {
+    await db.update(announcements).set({ isActive: false });
+    const [created] = await db.insert(announcements).values(announcement).returning();
+    return created;
+  }
+  async getChatSessions() {
+    const sessions = await db.select().from(chatSessions).orderBy(desc(chatSessions.lastMessageAt));
+    return sessions;
+  }
+  async getChatSession(sessionId) {
+    const [session3] = await db.select().from(chatSessions).where(eq(chatSessions.id, sessionId));
+    return session3 || void 0;
+  }
+  async createChatSession(session3) {
+    const [newSession] = await db.insert(chatSessions).values(session3).returning();
+    return newSession;
+  }
+  async updateChatSession(sessionId, updates) {
+    const [updatedSession] = await db.update(chatSessions).set(updates).where(eq(chatSessions.id, sessionId)).returning();
+    return updatedSession || void 0;
+  }
+  async getChatMessages(sessionId, limit = 50) {
+    const messages = await db.select().from(chatMessages).where(eq(chatMessages.sessionId, sessionId)).orderBy(desc(chatMessages.createdAt)).limit(limit);
+    return messages.reverse();
+  }
+  async addChatMessage(message) {
+    const [newMessage] = await db.insert(chatMessages).values(message).returning();
+    await db.update(chatSessions).set({ lastMessageAt: /* @__PURE__ */ new Date() }).where(eq(chatSessions.id, message.sessionId));
+    return newMessage;
+  }
+  async deleteChatSession(sessionId) {
+    try {
+      await db.delete(chatMessages).where(eq(chatMessages.sessionId, sessionId));
+      await db.delete(chatSessions).where(eq(chatSessions.id, sessionId));
+      return true;
+    } catch (error) {
+      console.error("Error deleting chat session:", error);
+      return false;
+    }
+  }
+  async deleteUser(id) {
+    try {
+      await db.delete(users).where(eq(users.id, id));
+      return true;
+    } catch (error) {
+      console.error("Error deleting user:", error);
+      return false;
+    }
+  }
+  // Category methods
+  async getAllCategories() {
+    return db.select().from(categories).orderBy(categories.name);
+  }
+  async getCategory(id) {
+    const result = await db.select().from(categories).where(eq(categories.id, id));
+    return result[0];
+  }
+  async createCategory(category) {
+    const result = await db.insert(categories).values(category).returning();
+    return result[0];
+  }
+  async updateCategory(id, updates) {
+    const result = await db.update(categories).set(updates).where(eq(categories.id, id)).returning();
+    return result[0];
+  }
+  async deleteCategory(id) {
+    try {
+      const categoryToDelete = await this.getCategory(id);
+      if (!categoryToDelete) {
+        return false;
+      }
+      await db.update(products).set({ category: "not provided" }).where(eq(products.category, categoryToDelete.name));
+      const result = await db.delete(categories).where(eq(categories.id, id));
+      return result.rowCount > 0;
+    } catch (error) {
+      console.error("Error deleting category:", error);
+      return false;
+    }
+  }
+  // Resource methods
+  async getAllResources() {
+    return db.select().from(resources).orderBy(desc(resources.createdAt));
+  }
+  async getResource(id) {
+    const result = await db.select().from(resources).where(eq(resources.id, id));
+    return result[0];
+  }
+  async createResource(resource) {
+    const result = await db.insert(resources).values(resource).returning();
+    return result[0];
+  }
+  async updateResource(id, updates) {
+    const result = await db.update(resources).set({ ...updates, updatedAt: /* @__PURE__ */ new Date() }).where(eq(resources.id, id)).returning();
+    return result[0];
+  }
+  async deleteResource(id) {
+    try {
+      const result = await db.delete(resources).where(eq(resources.id, id));
+      return result.rowCount > 0;
+    } catch (error) {
+      console.error("Error deleting resource:", error);
+      return false;
+    }
+  }
+};
+var storage = new DatabaseStorage();
+
+// server/auth.ts
+var scryptAsync = promisify(scrypt);
+async function hashPassword(password) {
+  const salt = randomBytes(16).toString("hex");
+  const buf = await scryptAsync(password, salt, 64);
+  return `${buf.toString("hex")}.${salt}`;
+}
+async function comparePasswords(supplied, stored) {
+  if (!stored.includes(".")) {
+    return supplied === stored;
+  }
+  const [hashed, salt] = stored.split(".");
+  if (!salt) {
+    return supplied === stored;
+  }
+  const hashedBuf = Buffer.from(hashed, "hex");
+  const suppliedBuf = await scryptAsync(supplied, salt, 64);
+  return timingSafeEqual(hashedBuf, suppliedBuf);
+}
+function setupAuth(app2) {
+  const sessionSettings = {
+    secret: process.env.SESSION_SECRET || "adi-cheats-secret-key-2024",
+    resave: false,
+    saveUninitialized: false,
+    store: storage.sessionStore,
+    cookie: {
+      secure: process.env.NODE_ENV === "production",
+      httpOnly: true,
+      maxAge: 24 * 60 * 60 * 1e3
+      // 24 hours
+    }
+  };
+  app2.set("trust proxy", 1);
+  app2.use(session2(sessionSettings));
+  app2.use(passport.initialize());
+  app2.use(passport.session());
+  passport.use(
+    new LocalStrategy(async (username, password, done) => {
+      try {
+        const user = await storage.getUserByUsername(username);
+        if (!user || !await comparePasswords(password, user.password)) {
+          return done(null, false);
+        }
+        return done(null, user);
+      } catch (error) {
+        return done(error);
+      }
+    })
+  );
+  passport.serializeUser((user, done) => done(null, user.id));
+  passport.deserializeUser(async (id, done) => {
+    try {
+      const user = await storage.getUser(id);
+      done(null, user);
+    } catch (error) {
+      done(error);
+    }
+  });
+  app2.post("/api/register", async (req, res, next) => {
+    try {
+      if (req.body.username !== "adi" || req.body.password !== "1") {
+        return res.status(403).json({ message: "Registration is restricted to authorized personnel only" });
+      }
+      const existingUser = await storage.getUserByUsername(req.body.username);
+      if (existingUser) {
+        return res.status(400).json({ message: "Admin account already exists" });
+      }
+      const user = await storage.createUser({
+        username: "adi",
+        password: await hashPassword("1"),
+        isAdmin: true
+      });
+      req.login(user, (err) => {
+        if (err) return next(err);
+        res.status(201).json(user);
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.post("/api/login", (req, res, next) => {
+    passport.authenticate("local", (err, user, info) => {
+      if (err) return next(err);
+      if (!user) {
+        return res.status(401).json({ message: "Invalid credentials" });
+      }
+      req.login(user, (err2) => {
+        if (err2) return next(err2);
+        res.status(200).json(user);
+      });
+    })(req, res, next);
+  });
+  app2.post("/api/logout", (req, res, next) => {
+    req.logout((err) => {
+      if (err) return next(err);
+      res.sendStatus(200);
+    });
+  });
+  app2.get("/api/user", (req, res) => {
+    if (!req.isAuthenticated()) return res.sendStatus(401);
+    res.json(req.user);
+  });
+}
+
+// server/routes.ts
+import { scrypt as scrypt2, randomBytes as randomBytes2 } from "crypto";
+import { promisify as promisify2 } from "util";
+var scryptAsync2 = promisify2(scrypt2);
+async function hashPassword2(password) {
+  const salt = randomBytes2(16).toString("hex");
+  const buf = await scryptAsync2(password, salt, 64);
+  return `${buf.toString("hex")}.${salt}`;
+}
+function registerRoutes(app2) {
+  setupAuth(app2);
+  const requireAuth = (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+    next();
+  };
+  app2.get("/api/products", async (req, res, next) => {
+    try {
+      const { category, search } = req.query;
+      const products2 = await storage.getAllProducts({
+        category,
+        search
+      });
+      res.json(products2);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.get("/api/products/:id", async (req, res, next) => {
+    try {
+      const id = parseInt(req.params.id);
+      const product = await storage.getProduct(id);
+      if (!product) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+      res.json(product);
+    } catch (error) {
+      next(error);
+    }
+  });
+  const requireAdmin = (req, res, next) => {
+    if (!req.isAuthenticated() || !req.user?.isAdmin) {
+      return res.status(403).json({ message: "Admin access required" });
+    }
+    next();
+  };
+  app2.get("/api/users", requireAdmin, async (req, res, next) => {
+    try {
+      const users2 = await storage.getAllUsers();
+      res.json(users2);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.post("/api/users", requireAdmin, async (req, res, next) => {
+    try {
+      const userData = insertUserSchema.parse(req.body);
+      const user = await storage.createUser(userData);
+      res.status(201).json(user);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.post("/api/products", requireAdmin, async (req, res, next) => {
+    try {
+      const productData = insertProductSchema.parse(req.body);
+      const product = await storage.createProduct(productData);
+      res.status(201).json(product);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.patch("/api/products/:id", requireAdmin, async (req, res, next) => {
+    try {
+      const id = parseInt(req.params.id);
+      const updates = updateProductSchema.parse(req.body);
+      const product = await storage.updateProduct(id, updates);
+      if (!product) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+      res.json(product);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.delete("/api/products/:id", requireAdmin, async (req, res, next) => {
+    try {
+      const id = parseInt(req.params.id);
+      const success = await storage.deleteProduct(id);
+      if (!success) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+      res.sendStatus(204);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.get("/api/announcements/active", async (req, res, next) => {
+    try {
+      const announcement = await storage.getActiveAnnouncement();
+      res.json(announcement);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.post("/api/announcements", requireAdmin, async (req, res, next) => {
+    try {
+      const announcementData = insertAnnouncementSchema.parse(req.body);
+      const announcement = await storage.updateAnnouncement(announcementData);
+      res.json(announcement);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.get("/api/chat/sessions", async (req, res, next) => {
+    try {
+      const sessions = await storage.getChatSessions();
+      res.json(sessions);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.post("/api/chat/sessions", async (req, res, next) => {
+    try {
+      const sessionData = insertChatSessionSchema.parse(req.body);
+      const session3 = await storage.createChatSession(sessionData);
+      res.status(201).json(session3);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.get("/api/chat/sessions/:sessionId/messages", async (req, res, next) => {
+    try {
+      const messages = await storage.getChatMessages(req.params.sessionId);
+      res.json(messages);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.post("/api/chat/messages", async (req, res, next) => {
+    try {
+      const chatMessage = insertChatMessageSchema.parse(req.body);
+      const savedMessage = await storage.addChatMessage(chatMessage);
+      wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          const clientInfo = connectedClients.get(client);
+          if (clientInfo && (clientInfo.sessionId === savedMessage.sessionId || clientInfo.isAdmin)) {
+            client.send(JSON.stringify({
+              type: "new_message",
+              payload: savedMessage
+            }));
+          }
+        }
+      });
+      res.status(201).json(savedMessage);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.delete("/api/chat/sessions/:sessionId", requireAuth, async (req, res, next) => {
+    try {
+      if (!req.user?.isAdmin) {
+        return res.status(403).json({ error: "Admin access required" });
+      }
+      const success = await storage.deleteChatSession(req.params.sessionId);
+      if (success) {
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            const clientInfo = connectedClients.get(client);
+            if (clientInfo && clientInfo.isAdmin) {
+              client.send(JSON.stringify({
+                type: "session_deleted",
+                sessionId: req.params.sessionId
+              }));
+            }
+          }
+        });
+        res.json({ success: true });
+      } else {
+        res.status(500).json({ error: "Failed to delete chat session" });
+      }
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.post("/api/users", requireAuth, async (req, res, next) => {
+    try {
+      const currentUser = await storage.getUser(req.user.id);
+      if (!currentUser || currentUser.role !== "owner") {
+        return res.status(403).json({ error: "Owner access required" });
+      }
+      const userData = insertUserSchema.parse({
+        ...req.body,
+        createdBy: req.user.id
+      });
+      const hashedPassword = await hashPassword2(userData.password);
+      const userDataWithHashedPassword = {
+        ...userData,
+        password: hashedPassword
+      };
+      const newUser = await storage.createUser(userDataWithHashedPassword);
+      res.status(201).json(newUser);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.delete("/api/users/:id", requireAuth, async (req, res, next) => {
+    try {
+      const currentUser = await storage.getUser(req.user.id);
+      if (!currentUser || currentUser.role !== "owner") {
+        return res.status(403).json({ error: "Owner access required" });
+      }
+      const userId = parseInt(req.params.id);
+      if (userId === req.user.id) {
+        return res.status(403).json({ error: "Cannot delete yourself" });
+      }
+      const success = await storage.deleteUser(userId);
+      if (success) {
+        res.json({ success: true });
+      } else {
+        res.status(500).json({ error: "Failed to delete user" });
+      }
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.get("/api/categories", async (req, res, next) => {
+    try {
+      const categories2 = await storage.getAllCategories();
+      res.json(categories2);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.post("/api/categories", requireAdmin, async (req, res, next) => {
+    try {
+      const result = insertCategorySchema.safeParse(req.body);
+      if (!result.success) {
+        return res.status(400).json({ message: "Invalid category data", errors: result.error.issues });
+      }
+      const category = await storage.createCategory(result.data);
+      res.status(201).json(category);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.delete("/api/categories/:id", requireAdmin, async (req, res, next) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid category ID" });
+      }
+      const success = await storage.deleteCategory(id);
+      if (!success) {
+        return res.status(404).json({ message: "Category not found" });
+      }
+      res.json({ message: "Category deleted successfully. Products with this category have been set to 'not provided'." });
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.get("/api/resources", async (req, res, next) => {
+    try {
+      const resources2 = await storage.getAllResources();
+      res.json(resources2);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.post("/api/resources", requireAdmin, async (req, res, next) => {
+    try {
+      const result = insertResourceSchema.safeParse(req.body);
+      if (!result.success) {
+        return res.status(400).json({ message: "Invalid resource data", errors: result.error.issues });
+      }
+      const resource = await storage.createResource(result.data);
+      res.status(201).json(resource);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.put("/api/resources/:id", requireAdmin, async (req, res, next) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid resource ID" });
+      }
+      const result = updateResourceSchema.safeParse(req.body);
+      if (!result.success) {
+        return res.status(400).json({ message: "Invalid resource data", errors: result.error.issues });
+      }
+      const resource = await storage.updateResource(id, result.data);
+      if (!resource) {
+        return res.status(404).json({ message: "Resource not found" });
+      }
+      res.json(resource);
+    } catch (error) {
+      next(error);
+    }
+  });
+  app2.delete("/api/resources/:id", requireAdmin, async (req, res, next) => {
+    try {
+      const id = parseInt(req.params.id);
+      if (isNaN(id)) {
+        return res.status(400).json({ message: "Invalid resource ID" });
+      }
+      const success = await storage.deleteResource(id);
+      if (!success) {
+        return res.status(404).json({ message: "Resource not found" });
+      }
+      res.json({ message: "Resource deleted successfully" });
+    } catch (error) {
+      next(error);
+    }
+  });
+  const httpServer = createServer(app2);
+  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const connectedClients = /* @__PURE__ */ new Map();
+  wss.on("connection", (ws2) => {
+    console.log("New WebSocket connection");
+    let clientSessionId = null;
+    ws2.on("message", async (data) => {
+      try {
+        const messageData = JSON.parse(data.toString());
+        if (messageData.type === "join_session") {
+          clientSessionId = messageData.sessionId;
+          connectedClients.set(ws2, { sessionId: clientSessionId });
+          console.log("Client joined session:", clientSessionId);
+          ws2.send(JSON.stringify({
+            type: "session_joined",
+            sessionId: clientSessionId
+          }));
+        }
+        if (messageData.type === "chat_message") {
+          const chatMessage = insertChatMessageSchema.parse(messageData.payload);
+          const savedMessage = await storage.addChatMessage(chatMessage);
+          let messagesSent = 0;
+          wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              const clientInfo = connectedClients.get(client);
+              if (clientInfo && (clientInfo.sessionId === savedMessage.sessionId || clientInfo.isAdmin)) {
+                client.send(JSON.stringify({
+                  type: "new_message",
+                  payload: savedMessage
+                }));
+                messagesSent++;
+                console.log(`Message sent to client in session: ${clientInfo.sessionId}, isAdmin: ${clientInfo.isAdmin}`);
+              }
+            }
+          });
+          console.log(`Total messages sent: ${messagesSent} for session: ${savedMessage.sessionId}`);
+          console.log("Message broadcasted:", savedMessage.message, "to session:", savedMessage.sessionId);
+        }
+        if (messageData.type === "admin_join") {
+          connectedClients.set(ws2, { isAdmin: true });
+          console.log("Admin joined WebSocket");
+          const sessions = await storage.getChatSessions();
+          ws2.send(JSON.stringify({
+            type: "admin_sessions",
+            payload: sessions
+          }));
+        }
+      } catch (error) {
+        console.error("WebSocket message error:", error);
+      }
+    });
+    ws2.on("close", () => {
+      console.log("WebSocket connection closed");
+      connectedClients.delete(ws2);
+    });
+  });
+  return httpServer;
+}
+
+// server/vite.ts
+import express from "express";
+import fs from "fs";
+import path2 from "path";
+import { createServer as createViteServer, createLogger } from "vite";
+
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "path";
+import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
+var vite_config_default = defineConfig({
+  plugins: [
+    react(),
+    runtimeErrorOverlay(),
+    ...process.env.NODE_ENV !== "production" && process.env.REPL_ID !== void 0 ? [
+      await import("@replit/vite-plugin-cartographer").then(
+        (m) => m.cartographer()
+      )
+    ] : []
+  ],
+  resolve: {
+    alias: {
+      "@": path.resolve(import.meta.dirname, "client", "src"),
+      "@shared": path.resolve(import.meta.dirname, "shared"),
+      "@assets": path.resolve(import.meta.dirname, "attached_assets")
+    }
+  },
+  root: path.resolve(import.meta.dirname, "client"),
+  build: {
+    outDir: path.resolve(import.meta.dirname, "dist/public"),
+    emptyOutDir: true
+  },
+  server: {
+    fs: {
+      strict: true,
+      deny: ["**/.*"]
+    }
+  }
+});
+
+// server/vite.ts
+import { nanoid } from "nanoid";
+var viteLogger = createLogger();
+function log(message, source = "express") {
+  const formattedTime = (/* @__PURE__ */ new Date()).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true
+  });
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+async function setupVite(app2, server) {
+  const serverOptions = {
+    middlewareMode: true,
+    hmr: { server },
+    allowedHosts: true
+  };
+  const vite = await createViteServer({
+    ...vite_config_default,
+    configFile: false,
+    customLogger: {
+      ...viteLogger,
+      error: (msg, options) => {
+        viteLogger.error(msg, options);
+        process.exit(1);
+      }
+    },
+    server: serverOptions,
+    appType: "custom"
+  });
+  app2.use(vite.middlewares);
+  app2.use("*", async (req, res, next) => {
+    const url = req.originalUrl;
+    try {
+      const clientTemplate = path2.resolve(
+        import.meta.dirname,
+        "..",
+        "client",
+        "index.html"
+      );
+      let template = await fs.promises.readFile(clientTemplate, "utf-8");
+      template = template.replace(
+        `src="/src/main.tsx"`,
+        `src="/src/main.tsx?v=${nanoid()}"`
+      );
+      const page = await vite.transformIndexHtml(url, template);
+      res.status(200).set({ "Content-Type": "text/html" }).end(page);
+    } catch (e) {
+      vite.ssrFixStacktrace(e);
+      next(e);
+    }
+  });
+}
+function serveStatic(app2) {
+  const distPath = path2.resolve(import.meta.dirname, "public");
+  if (!fs.existsSync(distPath)) {
+    throw new Error(
+      `Could not find the build directory: ${distPath}, make sure to build the client first`
+    );
+  }
+  app2.use(express.static(distPath));
+  app2.use("*", (_req, res) => {
+    res.sendFile(path2.resolve(distPath, "index.html"));
+  });
+}
+
+// server/index.ts
+var app = express2();
+app.use(express2.json());
+app.use(express2.urlencoded({ extended: false }));
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path3 = req.path;
+  let capturedJsonResponse = void 0;
+  const originalResJson = res.json;
+  res.json = function(bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path3.startsWith("/api")) {
+      let logLine = `${req.method} ${path3} ${res.statusCode} in ${duration}ms`;
+      if (capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+      if (logLine.length > 80) {
+        logLine = logLine.slice(0, 79) + "\u2026";
+      }
+      log(logLine);
+    }
+  });
+  next();
+});
+(async () => {
+  const server = await registerRoutes(app);
+  app.use((err, _req, res, _next) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+    res.status(status).json({ message });
+    throw err;
+  });
+  if (app.get("env") === "development") {
+    await setupVite(app, server);
+  } else {
+    serveStatic(app);
+  }
+  const port = 5e3;
+  server.listen({
+    port,
+    host: "0.0.0.0",
+    reusePort: true
+  }, () => {
+    log(`serving on port ${port}`);
+  });
+})();
